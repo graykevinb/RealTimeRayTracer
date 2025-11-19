@@ -35,6 +35,7 @@
         <div class="btn" data-key="e">▲</div>
         <div class="btn" data-key="q">▼</div>
         <div class="btn" id="upscale-btn" style="font-size: 10px;">Upscaling</div>
+        <div class="btn" id="denoise-btn" style="font-size: 10px;">Denoise</div>
     </div>
     <canvas id="canvas"></canvas>
     <script type="module">
@@ -274,28 +275,85 @@
                 // Read exactly the same pixel from previous frame (No spatial Reprojection)
                 let history = textureLoad(historyTex, id.xy, 0);
                 
-                // Calculate difference (Luma based)
-                let lumNew = luminance(radiance);
-                let lumOld = luminance(history.rgb);
-                let diff = abs(lumNew - lumOld);
+                // --- Temporal Reprojection ---
+                // Since we don't have motion vectors, we just use a strict accumulation policy.
+                // If u.frame is low (camera moving), use minimal history.
+                // If u.frame is high (camera still), use more history.
                 
-                // Adaptive Alpha:
-                // If diff is high (movement/change): alpha -> 0.0 (Take new sample)
-                // If diff is low (noise): alpha -> 0.95 (Accumulate)
-                // Sensitivity 2.0 means a 0.5 diff drops blend to 0.
-                let sensitivity = 2.0;
-                var alpha = clamp(1.0 - diff * sensitivity, 0.0, 0.95);
+                // The issue: When camera moves, u.frame resets to 0.
+                // So simply relying on u.frame for the mix factor is safer than trying to detect pixel differences without motion vectors.
                 
-                // Boost alpha if we have high samples to ensure convergence
-                if (history.a > 10.0) { alpha = max(alpha, 0.9); }
-                
-                // If frame is very low (just started moving), force fast blend
-                if (u.frame < 5.0) { alpha = 0.2; }
+                var alpha = 0.0;
+                if (u.frame < 5.0) {
+                     // Fast movement: very little history to avoid ghosting
+                     alpha = 0.2;
+                } else if (u.frame < 20.0) {
+                     // Settling: blend more
+                     alpha = 0.8;
+                } else {
+                     // Still: heavy accumulation
+                     alpha = 0.96;
+                }
 
                 finalColor = vec4f(mix(radiance, history.rgb, alpha), history.a + 1.0);
             }
             
             textureStore(outputTex, id.xy, finalColor);
+        }
+        `;
+
+        const denoiseShader = `
+        @group(0) @binding(0) var inputTex: texture_2d<f32>;
+        @group(0) @binding(1) var outputTex: texture_storage_2d<rgba16float, write>;
+        
+        struct Uniforms {
+            resolution: vec2f,
+            stepWidth: f32,
+            padding: f32,
+        };
+        @group(0) @binding(2) var<uniform> u: Uniforms;
+
+        @compute @workgroup_size(16, 16)
+        fn main(@builtin(global_invocation_id) id: vec3u) {
+            let dims = textureDimensions(inputTex);
+            if (id.x >= dims.x || id.y >= dims.y) { return; }
+
+            // A-Trous Wavelet Kernel (5x5) - Modified for simplicity
+            // Standard kernel: 1/16 * [1, 4, 6, 4, 1] for separable 1D.
+            // Using a sparse sparse approximation here:
+            
+            let center = textureLoad(inputTex, id.xy, 0);
+            let step = i32(u.stepWidth);
+            
+            var sum = center;
+            var cum_w = 1.0;
+            
+            // Reduced kernel size to 3x3 to prevent ringing/ghosting at edges
+            // and using a stricter edge weight.
+            for(var y = -1; y <= 1; y++) {
+                for(var x = -1; x <= 1; x++) {
+                    if(x==0 && y==0) { continue; }
+                    
+                    let uv = vec2i(id.xy) + vec2i(x, y) * step;
+                    if(uv.x < 0 || uv.y < 0 || uv.x >= i32(dims.x) || uv.y >= i32(dims.y)) { continue; }
+                    
+                    let c = textureLoad(inputTex, uv, 0);
+                    
+                    let diff = length(c.rgb - center.rgb);
+                    
+                    // Very strict edge stopping
+                    // Reduced from 256.0 to 64.0 because we are doing fewer passes, so we need slightly more blend power.
+                    let w_color = exp(-diff * diff * 64.0); 
+                    
+                    // Simple box weight
+                    let w = w_color;
+                    
+                    sum += c * w;
+                    cum_w += w;
+                }
+            }
+            
+            textureStore(outputTex, id.xy, sum / cum_w);
         }
         `;
 
@@ -356,11 +414,14 @@
         const sampEl = document.getElementById('samples');
 
         let device, context, computePipe, renderPipe, uBuff, texA, texB, bindGroupA, bindGroupB, sampler;
+        // Denoise globals
+        let denoisePipe, denoiseBuff, denoiseBindGroups = [], texDenoiseA, texDenoiseB;
         let frame = 0, cam = { pos: [0,0,2.7], pitch:0, yaw:Math.PI }, keys = {};
         let drag = false, lastMouse = {x:0, y:0}, lastTime = 0;
         let dragTouchId = null;
         let pingPong = 0;
         let upscalingEnabled = false;
+        let denoisingEnabled = false;
         let renderScale = 1.0;
 
         async function init() {
@@ -374,9 +435,12 @@
             sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
 
             computePipe = device.createComputePipeline({ layout: 'auto', compute: { module: device.createShaderModule({ code: computeShader }), entryPoint: 'main' }});
+            denoisePipe = device.createComputePipeline({ layout: 'auto', compute: { module: device.createShaderModule({ code: denoiseShader }), entryPoint: 'main' }});
             renderPipe = device.createRenderPipeline({ layout: 'auto', vertex: { module: device.createShaderModule({ code: displayShader }), entryPoint: 'vs' }, fragment: { module: device.createShaderModule({ code: displayShader }), entryPoint: 'fs', targets: [{ format: 'bgra8unorm' }] }});
 
             uBuff = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+            denoiseBuff = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
             window.addEventListener('resize', resize);
             setupInput();
             resize();
@@ -398,11 +462,32 @@
 
             frame = 0; 
             if(texA) texA.destroy(); if(texB) texB.destroy();
+            if(texDenoiseA) texDenoiseA.destroy(); if(texDenoiseB) texDenoiseB.destroy();
+
             texA = createTex(rndW, rndH);
             texB = createTex(rndW, rndH);
+            texDenoiseA = createTex(rndW, rndH);
+            texDenoiseB = createTex(rndW, rndH);
 
             bindGroupA = device.createBindGroup({ layout: computePipe.getBindGroupLayout(0), entries: [{binding:0, resource:{buffer:uBuff}}, {binding:1, resource:texA.createView()}, {binding:2, resource:texB.createView()}]});
             bindGroupB = device.createBindGroup({ layout: computePipe.getBindGroupLayout(0), entries: [{binding:0, resource:{buffer:uBuff}}, {binding:1, resource:texB.createView()}, {binding:2, resource:texA.createView()}]});
+        
+            // Denoise bind groups (ping-ponging for 5 levels)
+            // We need pairs for each pass: (Input, Output)
+            // Pass 1: In=RenderOutput, Out=TmpA
+            // Pass 2: In=TmpA, Out=TmpB
+            // Pass 3: In=TmpB, Out=TmpA ...
+            
+            // However, simpler: 
+            // BindGroup 0: In=texB (Render Target), Out=texDenoiseA
+            // BindGroup 1: In=texDenoiseA, Out=texDenoiseB
+            // BindGroup 2: In=texDenoiseB, Out=texDenoiseA
+            denoiseBindGroups = [];
+            denoiseBindGroups.push(device.createBindGroup({ layout: denoisePipe.getBindGroupLayout(0), entries: [{binding:0, resource:texB.createView()}, {binding:1, resource:texDenoiseA.createView()}, {binding:2, resource:{buffer:denoiseBuff}}] }));
+            denoiseBindGroups.push(device.createBindGroup({ layout: denoisePipe.getBindGroupLayout(0), entries: [{binding:0, resource:texA.createView()}, {binding:1, resource:texDenoiseA.createView()}, {binding:2, resource:{buffer:denoiseBuff}}] })); // Alternate render target source
+            
+            denoiseBindGroups.push(device.createBindGroup({ layout: denoisePipe.getBindGroupLayout(0), entries: [{binding:0, resource:texDenoiseA.createView()}, {binding:1, resource:texDenoiseB.createView()}, {binding:2, resource:{buffer:denoiseBuff}}] }));
+            denoiseBindGroups.push(device.createBindGroup({ layout: denoisePipe.getBindGroupLayout(0), entries: [{binding:0, resource:texDenoiseB.createView()}, {binding:1, resource:texDenoiseA.createView()}, {binding:2, resource:{buffer:denoiseBuff}}] }));
         }
 
         function updateCam() {
@@ -438,9 +523,45 @@
             cPass.dispatchWorkgroups(Math.ceil(texA.width/16), Math.ceil(texA.height/16));
             cPass.end();
 
+            if(denoisingEnabled) {
+                const dPass = enc.beginComputePass();
+                dPass.setPipeline(denoisePipe);
+                
+                let step = 1;
+                // Initial Pass: Render Target -> Denoise A
+                // Depending on pingPong, render target is in texB (pingPong=0) or texA (pingPong=1)
+                // denoiseBindGroups[0] reads from texB, [1] reads from texA
+                dPass.setBindGroup(0, denoiseBindGroups[pingPong]); 
+                device.queue.writeBuffer(denoiseBuff, 0, new Float32Array([texA.width, texA.height, step, 0]));
+                dPass.dispatchWorkgroups(Math.ceil(texA.width/16), Math.ceil(texA.height/16));
+                
+                // Subsequent passes ping-pong between DenoiseA and DenoiseB
+                // Reduced passes from 4 to 2 (Total 3 passes: 1, 2, 4) to prevent long-distance ghosting.
+                // Without G-Buffers (Normals/Depth), large strides (8, 16) are unsafe.
+                for(let i=0; i<2; i++) {
+                    step *= 2;
+                    let idx = 2 + (i%2); // BindGroup 2 or 3
+                    dPass.setBindGroup(0, denoiseBindGroups[idx]);
+                    device.queue.writeBuffer(denoiseBuff, 0, new Float32Array([texA.width, texA.height, step, 0]));
+                    dPass.dispatchWorkgroups(Math.ceil(texA.width/16), Math.ceil(texA.height/16));
+                }
+                dPass.end();
+            }
+
             const rPass = enc.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store' }] });
             rPass.setPipeline(renderPipe);
-            const dispBind = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [{binding:0, resource:dTex.createView()}, {binding:1, resource:sampler}, {binding:2, resource:{buffer:uBuff}}] });
+            
+            // Final result depends on ping-pong count.
+            // Pass 1: Render->A.
+            // Loop 0: A->B.
+            // Loop 1: B->A.
+            // Result ends in A.
+            let finalTex = dTex;
+            if(denoisingEnabled) {
+                 finalTex = texDenoiseA;
+            }
+
+            const dispBind = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [{binding:0, resource:finalTex.createView()}, {binding:1, resource:sampler}, {binding:2, resource:{buffer:uBuff}}] });
             rPass.setBindGroup(0, dispBind);
             rPass.draw(6);
             rPass.end();
@@ -466,6 +587,16 @@
             };
             fsrBtn.addEventListener('pointerdown', toggleFsr);
 
+            // Denoise Toggle
+            const denoiseBtn = document.getElementById('denoise-btn');
+            const toggleDenoise = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                denoisingEnabled = !denoisingEnabled;
+                denoiseBtn.style.background = denoisingEnabled ? 'rgba(100, 255, 100, 0.5)' : '';
+            };
+            denoiseBtn.addEventListener('pointerdown', toggleDenoise);
+
             // Mouse
             canvas.addEventListener('click', () => canvas.requestPointerLock());
             window.addEventListener('mousemove', e => {
@@ -475,7 +606,7 @@
             });
 
             // Touch
-            document.querySelectorAll('.btn:not(#upscale-btn)').forEach(b => {
+            document.querySelectorAll('.btn:not(#upscale-btn):not(#denoise-btn)').forEach(b => {
                 b.addEventListener('touchstart', (e) => { e.preventDefault(); keys[b.dataset.key] = true; });
                 b.addEventListener('touchend', (e) => { e.preventDefault(); keys[b.dataset.key] = false; });
             });
