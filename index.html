@@ -34,6 +34,7 @@
     <div id="controls-right">
         <div class="btn" data-key="e">▲</div>
         <div class="btn" data-key="q">▼</div>
+        <div class="btn" id="upscale-btn" style="font-size: 10px;">Upscaling</div>
     </div>
     <canvas id="canvas"></canvas>
     <script type="module">
@@ -103,7 +104,7 @@
         };
 
         struct Ray { origin: vec3f, direction: vec3f };
-        struct Hit { t: f32, pos: vec3f, normal: vec3f, color: vec3f, emission: vec3f, hit: bool };
+        struct Hit { t: f32, pos: vec3f, normal: vec3f, color: vec3f, emission: vec3f, mat: u32, hit: bool };
 
         @group(0) @binding(0) var<uniform> u: Uniforms;
         @group(0) @binding(1) var historyTex: texture_2d<f32>;
@@ -123,7 +124,8 @@
                 let t = (d - dot(n, r.origin)) / denom;
                 if (t > 0.001 && t < *tMax) {
                     *tMax = t; (*best).t = t; (*best).pos = r.origin + r.direction * t;
-                    (*best).normal = select(n, -n, denom > 0.0); (*best).color = col; (*best).emission = emiss; (*best).hit = true;
+                    (*best).normal = select(n, -n, denom > 0.0); (*best).color = col; (*best).emission = emiss;
+                    (*best).mat = 0u; (*best).hit = true;
                 }
             }
         }
@@ -137,7 +139,7 @@
             let tmin = max(small.x, max(small.y, small.z)); let tmax_box = min(big.x, min(big.y, big.z));
             if(tmin < tmax_box && tmin > 0.001 && tmin < *tMax) {
                 *tMax = tmin; (*best).t = tmin; (*best).pos = r.origin + r.direction * tmin;
-                (*best).color = col; (*best).emission = vec3f(0.0); (*best).hit = true;
+                (*best).color = col; (*best).emission = vec3f(0.0); (*best).mat = 0u; (*best).hit = true;
                 let p = ro + rd * tmin; let bias = 1.0001;
                 var n = vec3f(0.0);
                 if(abs(p.x)>=s.x/bias){n=vec3f(sign(p.x),0.0,0.0);} else if(abs(p.y)>=s.y/bias){n=vec3f(0.0,sign(p.y),0.0);} else{n=vec3f(0.0,0.0,sign(p.z));}
@@ -145,8 +147,26 @@
             }
         }
 
+        fn hitSphere(r: Ray, c: vec3f, rad: f32, col: vec3f, mat: u32, tMax: ptr<function, f32>, best: ptr<function, Hit>) {
+            let oc = r.origin - c;
+            let b = dot(oc, r.direction);
+            let det = b*b - (dot(oc,oc) - rad*rad);
+            if(det > 0.0) {
+                let sq = sqrt(det);
+                var t = -b - sq;
+                if(t < 0.001) { t = -b + sq; }
+                if(t > 0.001 && t < *tMax) {
+                    *tMax = t;
+                    (*best).t = t; (*best).pos = r.origin + r.direction * t;
+                    (*best).normal = ((*best).pos - c) / rad;
+                    (*best).color = col; (*best).emission = vec3f(0.0);
+                    (*best).mat = mat; (*best).hit = true;
+                }
+            }
+        }
+
         fn scene(r: Ray) -> Hit {
-            var best: Hit; best.hit = false; best.t = 1e20; best.emission = vec3f(0.0); var tMax = 1e20;
+            var best: Hit; best.hit = false; best.t = 1e20; best.emission = vec3f(0.0); best.mat = 0u; var tMax = 1e20;
             let white=vec3f(0.73); let red=vec3f(0.65,0.05,0.05); let green=vec3f(0.12,0.45,0.15);
             hitPlane(r, vec3f(1.0,0.0,0.0), -1.0, green, vec3f(0.0), &tMax, &best);
             hitPlane(r, vec3f(-1.0,0.0,0.0), -1.0, red, vec3f(0.0), &tMax, &best);
@@ -157,17 +177,19 @@
             if(tLight > 0.001 && tLight < tMax) {
                 let p = r.origin + r.direction * tLight;
                 if(p.x > -0.25 && p.x < 0.25 && p.z > -0.25 && p.z < 0.25) {
-                    best.hit = true; best.t = tLight; best.pos = p; best.normal = vec3f(0.0,-1.0,0.0); best.emission = vec3f(15.0); tMax = tLight;
+                    best.hit = true; best.t = tLight; best.pos = p; best.normal = vec3f(0.0,-1.0,0.0); 
+                    best.emission = vec3f(15.0); best.mat = 0u; tMax = tLight;
                 }
             }
             hitBox(r, vec3f(-0.27,-0.4,0.3), vec3f(0.28,0.6,0.28), -0.3, white, &tMax, &best);
             hitBox(r, vec3f(0.27,-0.7,-0.2), vec3f(0.28,0.3,0.28), 0.3, white, &tMax, &best);
+            hitSphere(r, vec3f(0.0, -0.7, 0.15), 0.3, vec3f(0.98), 1u, &tMax, &best);
             return best;
         }
 
         fn shadow(p: vec3f, l: vec3f) -> bool {
             let d = l-p; let len = length(d); let hit = scene(Ray(p, d/len));
-            return !hit.hit || hit.t >= len - 0.01 || length(hit.emission) > 0.0;
+            return !hit.hit || hit.t >= len - 0.01 || (hit.mat == 1u) || length(hit.emission) > 0.0;
         }
 
         fn luminance(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
@@ -185,26 +207,63 @@
             var ray = Ray(u.cameraPos.xyz, dir);
 
             var throughput = vec3f(1.0); var radiance = vec3f(0.0);
-            for(var b=0; b<4; b++) {
+            var specularBounce = true;
+
+            for(var b=0; b<8; b++) {
                 let hit = scene(ray);
                 if(!hit.hit) { break; }
-                if(length(hit.emission) > 0.0) { if(b==0){ radiance+=throughput*hit.emission; } break; }
-                // NEE
-                let lx = rand(&seed)*0.5-0.25; let lz = rand(&seed)*0.5-0.25; let lPos = vec3f(lx, 0.998, lz);
-                let toL = lPos - hit.pos; let d2 = dot(toL,toL); let dist = sqrt(d2); let L = toL/dist;
-                let ndl = max(0.0, dot(hit.normal, L));
-                if(ndl > 0.0 && shadow(hit.pos+hit.normal*0.001, lPos)) {
-                    let lCos = max(0.0, dot(vec3f(0.0,-1.0,0.0), -L));
-                    radiance += throughput * hit.color * vec3f(15.0) * (ndl * 0.25 / d2) * lCos * 0.3183;
+                if(length(hit.emission) > 0.0) { 
+                    if(specularBounce){ radiance+=throughput*hit.emission; } 
+                    break; 
                 }
-                throughput *= hit.color;
-                let r1=rand(&seed); let r2=rand(&seed); let phi=6.283*r1; let sq=sqrt(r2);
-                let loc = vec3f(cos(phi)*sq, sin(phi)*sq, sqrt(1.0-r2));
-                let n = hit.normal;
-                let a = select(vec3f(1.0,0.0,0.0), vec3f(0.0,1.0,0.0), abs(n.x)>0.9);
-                let t = normalize(cross(n,a)); let bt = cross(n,t);
-                ray.direction = t*loc.x + bt*loc.y + n*loc.z;
-                ray.origin = hit.pos + n*0.001;
+                
+                if (hit.mat == 1u) { // Glass
+                    let n = hit.normal;
+                    let d = ray.direction;
+                    let dotDN = dot(d, n);
+                    let isFront = dotDN < 0.0;
+                    let realN = select(-n, n, isFront);
+                    let eta = select(1.5, 1.0/1.5, isFront);
+
+                    let cosTheta = min(dot(-d, realN), 1.0);
+                    let sinTheta = sqrt(1.0 - cosTheta*cosTheta);
+                    
+                    let cannotRefract = eta * sinTheta > 1.0;
+                    let r0 = (1.0 - 1.5)/(1.0 + 1.5); let r0s = r0*r0;
+                    let schlick = r0s + (1.0 - r0s)*pow(1.0 - cosTheta, 5.0);
+                    
+                    var newDir = vec3f(0.0);
+                    if (cannotRefract || schlick > rand(&seed)) {
+                        newDir = reflect(d, realN);
+                    } else {
+                        newDir = refract(d, realN, eta);
+                    }
+                    
+                    ray.origin = hit.pos + newDir * 0.001;
+                    ray.direction = newDir;
+                    throughput *= hit.color;
+                    specularBounce = true;
+                } else {
+                    // Diffuse NEE
+                    let lx = rand(&seed)*0.5-0.25; let lz = rand(&seed)*0.5-0.25; let lPos = vec3f(lx, 0.998, lz);
+                    let toL = lPos - hit.pos; let d2 = dot(toL,toL); let dist = sqrt(d2); let L = toL/dist;
+                    let ndl = max(0.0, dot(hit.normal, L));
+                    if(ndl > 0.0 && shadow(hit.pos+hit.normal*0.001, lPos)) {
+                        let lCos = max(0.0, dot(vec3f(0.0,-1.0,0.0), -L));
+                        radiance += throughput * hit.color * vec3f(15.0) * (ndl * 0.25 / d2) * lCos * 0.3183;
+                    }
+                    
+                    throughput *= hit.color;
+                    let r1=rand(&seed); let r2=rand(&seed); let phi=6.283*r1; let sq=sqrt(r2);
+                    let loc = vec3f(cos(phi)*sq, sin(phi)*sq, sqrt(1.0-r2));
+                    let n = hit.normal;
+                    let a = select(vec3f(1.0,0.0,0.0), vec3f(0.0,1.0,0.0), abs(n.x)>0.9);
+                    let t = normalize(cross(n,a)); let bt = cross(n,t);
+                    ray.direction = t*loc.x + bt*loc.y + n*loc.z;
+                    ray.origin = hit.pos + n*0.001;
+                    specularBounce = false;
+                }
+
                 if(b>2) { let p = max(throughput.x, max(throughput.y, throughput.z)); if(rand(&seed)>p){break;} throughput/=p; }
             }
 
@@ -241,15 +300,52 @@
         `;
 
         const displayShader = `
+            struct Uniforms {
+                cameraPos: vec4f,
+                cameraFwd: vec4f,
+                cameraRight: vec4f,
+                cameraUp: vec4f,
+                resolution: vec2f,
+                frame: f32,
+                upscalingEnabled: f32,
+            };
             @group(0) @binding(0) var inputTex: texture_2d<f32>;
             @group(0) @binding(1) var mySampler: sampler;
+            @group(0) @binding(2) var<uniform> u: Uniforms;
+
             struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
             @vertex fn vs(@builtin(vertex_index) i: u32) -> VSOut {
                 var p = array<vec2f,6>(vec2f(-1,-1),vec2f(1,-1),vec2f(-1,1),vec2f(-1,1),vec2f(1,-1),vec2f(1,1));
                 var o: VSOut; o.pos = vec4f(p[i],0.0,1.0); o.uv = p[i]*vec2f(0.5,-0.5)+0.5; return o;
             }
+
+            // Simple RCAS-like sharpening
+            fn fsr_rcas(uv: vec2f) -> vec3f {
+                let c = textureSample(inputTex, mySampler, uv).rgb;
+                // If FSR is enabled, we expect the input to be upscaled by the hardware sampler (Bilinear).
+                // We just add a simple sharpen filter here to mimic RCAS.
+                
+                let texDim = vec2f(textureDimensions(inputTex));
+                let one = 1.0 / texDim;
+                
+                let n = textureSample(inputTex, mySampler, uv + vec2f(0.0, -one.y)).rgb;
+                let s = textureSample(inputTex, mySampler, uv + vec2f(0.0, one.y)).rgb;
+                let e = textureSample(inputTex, mySampler, uv + vec2f(one.x, 0.0)).rgb;
+                let w = textureSample(inputTex, mySampler, uv + vec2f(-one.x, 0.0)).rgb;
+
+                // Simple Unsharp Mask for demo purposes (RCAS is more complex)
+                let neighbors = (n + s + e + w) * 0.25;
+                let detail = c - neighbors;
+                return c + detail * 0.5; // 0.5 sharpness
+            }
+
             @fragment fn fs(in: VSOut) -> @location(0) vec4f {
-                let c = textureSample(inputTex, mySampler, in.uv).rgb;
+                var c = vec3f(0.0);
+                if (u.upscalingEnabled > 0.5) {
+                    c = fsr_rcas(in.uv);
+                } else {
+                    c = textureSample(inputTex, mySampler, in.uv).rgb;
+                }
                 let m = c / (c + vec3f(1.0)); // Reinhard
                 return vec4f(pow(m, vec3f(0.4545)), 1.0); // Gamma
             }
@@ -259,11 +355,13 @@
         const fpsEl = document.getElementById('fps');
         const sampEl = document.getElementById('samples');
 
-        let device, context, computePipe, renderPipe, uBuff, texA, texB, bindGroupA, bindGroupB;
+        let device, context, computePipe, renderPipe, uBuff, texA, texB, bindGroupA, bindGroupB, sampler;
         let frame = 0, cam = { pos: [0,0,2.7], pitch:0, yaw:Math.PI }, keys = {};
         let drag = false, lastMouse = {x:0, y:0}, lastTime = 0;
         let dragTouchId = null;
         let pingPong = 0;
+        let upscalingEnabled = false;
+        let renderScale = 1.0;
 
         async function init() {
             if(!navigator.gpu) return alert("WebGPU not supported");
@@ -272,6 +370,8 @@
             device.addEventListener('uncapturederror', e => logError(e.error.message));
             context = canvas.getContext('webgpu');
             context.configure({ device, format: 'bgra8unorm' });
+            
+            sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
 
             computePipe = device.createComputePipeline({ layout: 'auto', compute: { module: device.createShaderModule({ code: computeShader }), entryPoint: 'main' }});
             renderPipe = device.createRenderPipeline({ layout: 'auto', vertex: { module: device.createShaderModule({ code: displayShader }), entryPoint: 'vs' }, fragment: { module: device.createShaderModule({ code: displayShader }), entryPoint: 'fs', targets: [{ format: 'bgra8unorm' }] }});
@@ -288,12 +388,18 @@
         }
 
         function resize() {
-            canvas.width = window.innerWidth * window.devicePixelRatio;
-            canvas.height = window.innerHeight * window.devicePixelRatio;
+            const dispW = window.innerWidth * window.devicePixelRatio;
+            const dispH = window.innerHeight * window.devicePixelRatio;
+            canvas.width = dispW;
+            canvas.height = dispH;
+            
+            const rndW = Math.floor(dispW * renderScale);
+            const rndH = Math.floor(dispH * renderScale);
+
             frame = 0; 
             if(texA) texA.destroy(); if(texB) texB.destroy();
-            texA = createTex(canvas.width, canvas.height);
-            texB = createTex(canvas.width, canvas.height);
+            texA = createTex(rndW, rndH);
+            texB = createTex(rndW, rndH);
 
             bindGroupA = device.createBindGroup({ layout: computePipe.getBindGroupLayout(0), entries: [{binding:0, resource:{buffer:uBuff}}, {binding:1, resource:texA.createView()}, {binding:2, resource:texB.createView()}]});
             bindGroupB = device.createBindGroup({ layout: computePipe.getBindGroupLayout(0), entries: [{binding:0, resource:{buffer:uBuff}}, {binding:1, resource:texB.createView()}, {binding:2, resource:texA.createView()}]});
@@ -320,7 +426,7 @@
             frame++;
             sampEl.innerText = frame;
 
-            device.queue.writeBuffer(uBuff, 0, new Float32Array([...cam.pos, 0, ...vecs.fwd, 0, ...vecs.r, 0, ...vecs.u, 0, canvas.width, canvas.height, frame, 0]));
+            device.queue.writeBuffer(uBuff, 0, new Float32Array([...cam.pos, 0, ...vecs.fwd, 0, ...vecs.r, 0, ...vecs.u, 0, texA.width, texA.height, frame, upscalingEnabled ? 1 : 0]));
 
             const enc = device.createCommandEncoder();
             const cBind = pingPong === 0 ? bindGroupA : bindGroupB;
@@ -329,12 +435,12 @@
             const cPass = enc.beginComputePass();
             cPass.setPipeline(computePipe);
             cPass.setBindGroup(0, cBind);
-            cPass.dispatchWorkgroups(Math.ceil(canvas.width/8), Math.ceil(canvas.height/8));
+            cPass.dispatchWorkgroups(Math.ceil(texA.width/8), Math.ceil(texA.height/8));
             cPass.end();
 
             const rPass = enc.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store' }] });
             rPass.setPipeline(renderPipe);
-            const dispBind = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [{binding:0, resource:dTex.createView()}, {binding:1, resource:device.createSampler()}] });
+            const dispBind = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [{binding:0, resource:dTex.createView()}, {binding:1, resource:sampler}, {binding:2, resource:{buffer:uBuff}}] });
             rPass.setBindGroup(0, dispBind);
             rPass.draw(6);
             rPass.end();
@@ -348,6 +454,18 @@
             window.addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
             window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
             
+            // FSR Toggle
+            const fsrBtn = document.getElementById('upscale-btn');
+            const toggleFsr = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                upscalingEnabled = !upscalingEnabled;
+                renderScale = upscalingEnabled ? 0.67 : 1.0;
+                fsrBtn.style.background = upscalingEnabled ? 'rgba(100, 255, 100, 0.5)' : '';
+                resize();
+            };
+            fsrBtn.addEventListener('pointerdown', toggleFsr);
+
             // Mouse
             canvas.addEventListener('click', () => canvas.requestPointerLock());
             window.addEventListener('mousemove', e => {
@@ -357,7 +475,7 @@
             });
 
             // Touch
-            document.querySelectorAll('.btn').forEach(b => {
+            document.querySelectorAll('.btn:not(#upscale-btn)').forEach(b => {
                 b.addEventListener('touchstart', (e) => { e.preventDefault(); keys[b.dataset.key] = true; });
                 b.addEventListener('touchend', (e) => { e.preventDefault(); keys[b.dataset.key] = false; });
             });
