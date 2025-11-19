@@ -147,10 +147,10 @@
             }
         }
 
-        fn hitSphere(r: Ray, c: vec3f, rad: f32, col: vec3f, mat: u32, tMax: ptr<function, f32>, best: ptr<function, Hit>) {
+        fn hitSphere(r: Ray, c: vec3f, radSq: f32, invRad: f32, col: vec3f, mat: u32, tMax: ptr<function, f32>, best: ptr<function, Hit>) {
             let oc = r.origin - c;
             let b = dot(oc, r.direction);
-            let det = b*b - (dot(oc,oc) - rad*rad);
+            let det = b*b - (dot(oc,oc) - radSq);
             if(det > 0.0) {
                 let sq = sqrt(det);
                 var t = -b - sq;
@@ -158,7 +158,7 @@
                 if(t > 0.001 && t < *tMax) {
                     *tMax = t;
                     (*best).t = t; (*best).pos = r.origin + r.direction * t;
-                    (*best).normal = ((*best).pos - c) / rad;
+                    (*best).normal = ((*best).pos - c) * invRad;
                     (*best).color = col; (*best).emission = vec3f(0.0);
                     (*best).mat = mat; (*best).hit = true;
                 }
@@ -181,9 +181,9 @@
                     best.emission = vec3f(15.0); best.mat = 0u; tMax = tLight;
                 }
             }
+            hitSphere(r, vec3f(0.0, -0.7, 0.15), 0.09, 3.3333, vec3f(0.98), 1u, &tMax, &best);
             hitBox(r, vec3f(-0.27,-0.4,0.3), vec3f(0.28,0.6,0.28), -0.3, white, &tMax, &best);
             hitBox(r, vec3f(0.27,-0.7,-0.2), vec3f(0.28,0.3,0.28), 0.3, white, &tMax, &best);
-            hitSphere(r, vec3f(0.0, -0.7, 0.15), 0.3, vec3f(0.98), 1u, &tMax, &best);
             return best;
         }
 
@@ -194,7 +194,7 @@
 
         fn luminance(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
 
-        @compute @workgroup_size(8, 8)
+        @compute @workgroup_size(16, 16)
         fn main(@builtin(global_invocation_id) id: vec3u) {
             let dims = textureDimensions(outputTex);
             if (id.x >= dims.x || id.y >= dims.y) { return; }
@@ -209,7 +209,7 @@
             var throughput = vec3f(1.0); var radiance = vec3f(0.0);
             var specularBounce = true;
 
-            for(var b=0; b<8; b++) {
+            for(var b=0; b<6; b++) {
                 let hit = scene(ray);
                 if(!hit.hit) { break; }
                 if(length(hit.emission) > 0.0) { 
@@ -435,7 +435,7 @@
             const cPass = enc.beginComputePass();
             cPass.setPipeline(computePipe);
             cPass.setBindGroup(0, cBind);
-            cPass.dispatchWorkgroups(Math.ceil(texA.width/8), Math.ceil(texA.height/8));
+            cPass.dispatchWorkgroups(Math.ceil(texA.width/16), Math.ceil(texA.height/16));
             cPass.end();
 
             const rPass = enc.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store' }] });
@@ -470,7 +470,7 @@
             canvas.addEventListener('click', () => canvas.requestPointerLock());
             window.addEventListener('mousemove', e => {
                 if(document.pointerLockElement !== canvas) return;
-                cam.yaw -= e.movementX*0.005; cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch+e.movementY*0.005));
+                cam.yaw -= e.movementX*0.005; cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch-e.movementY*0.005));
                 frame = 0;
             });
 
