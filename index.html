@@ -94,6 +94,7 @@
             }
         };
 
+        const MAX_BOUNCES = 6;
         const computeShader = `
         struct Uniforms {
             cameraPos: vec4f,
@@ -253,7 +254,7 @@
             var firstHitNorm = vec3f(0.0);
             var firstHitDepth = 0.0;
 
-            for(var b=0; b<6; b++) {
+            for(var b=0; b<${MAX_BOUNCES}; b++) {
                 let hit = scene(ray);
                 if(!hit.hit) { break; }
                 
@@ -362,7 +363,7 @@
             var firstDiffuse = true;
             
             // Simple loop to find first diffuse hit
-            for(var b=0; b<6; b++) {
+            for(var b=0; b<${MAX_BOUNCES}; b++) {
                 if(!hit.hit) { break; }
                 if(length(hit.emission) > 0.0) { 
                     if(specularBounce){ radiance+=throughput*hit.emission; } 
