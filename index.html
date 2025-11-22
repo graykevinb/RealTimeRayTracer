@@ -105,12 +105,24 @@
             padding: f32,
         };
 
+        struct Reservoir {
+            y: vec4f,       // Light sample position (xyz)
+            w_sum: f32,     // Sum of weights
+            M: u32,         // Count
+            W: f32,         // RIS weight
+            pad: u32        // Padding to 32 bytes
+        };
+
         struct Ray { origin: vec3f, direction: vec3f };
         struct Hit { t: f32, pos: vec3f, normal: vec3f, color: vec3f, emission: vec3f, mat: u32, hit: bool };
 
         @group(0) @binding(0) var<uniform> u: Uniforms;
         @group(0) @binding(1) var historyTex: texture_2d<f32>;
         @group(0) @binding(2) var outputTex: texture_storage_2d<rgba16float, write>;
+        @group(0) @binding(3) var<storage, read> resInput: array<Reservoir>;
+        @group(0) @binding(4) var<storage, read_write> resOutput: array<Reservoir>;
+        @group(0) @binding(5) var normDepthInput: texture_2d<f32>;
+        @group(0) @binding(6) var normDepthOutput: texture_storage_2d<rgba16float, write>;
 
         // PCG Random (Artifact Free)
         fn rand(seed: ptr<function, u32>) -> f32 {
@@ -176,13 +188,13 @@
             hitPlane(r, vec3f(0.0,-1.0,0.0), -1.0, white, vec3f(0.0), &tMax, &best);
             hitPlane(r, vec3f(0.0,0.0,1.0), -1.0, white, vec3f(0.0), &tMax, &best);
             let tLight = (0.998 - r.origin.y) / r.direction.y;
-            if(tLight > 0.001 && tLight < tMax) {
-                let p = r.origin + r.direction * tLight;
-                if(p.x > -0.25 && p.x < 0.25 && p.z > -0.25 && p.z < 0.25) {
-                    best.hit = true; best.t = tLight; best.pos = p; best.normal = vec3f(0.0,-1.0,0.0); 
-                    best.emission = vec3f(15.0); best.mat = 0u; tMax = tLight;
+                if(tLight > 0.001 && tLight < tMax) {
+                    let p = r.origin + r.direction * tLight;
+                    if(p.x > -0.25 && p.x < 0.25 && p.z > -0.25 && p.z < 0.25) {
+                        best.hit = true; best.t = tLight; best.pos = p; best.normal = vec3f(0.0,-1.0,0.0); 
+                        best.emission = vec3f(15.0); best.mat = 0u; tMax = tLight;
+                    }
                 }
-            }
             hitSphere(r, vec3f(0.0, -0.7, 0.15), 0.09, 3.3333, vec3f(0.98), 1u, &tMax, &best);
             hitBox(r, vec3f(-0.27,-0.4,0.3), vec3f(0.28,0.6,0.28), -0.3, white, &tMax, &best);
             hitBox(r, vec3f(0.27,-0.7,-0.2), vec3f(0.28,0.3,0.28), 0.3, white, &tMax, &best);
@@ -195,6 +207,31 @@
         }
 
         fn luminance(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
+
+        fn emptyReservoir() -> Reservoir {
+            return Reservoir(vec4f(0.0), 0.0, 0u, 0.0, 0u);
+        }
+
+        fn updateReservoir(r: ptr<function, Reservoir>, y: vec4f, w: f32, c: u32, seed: ptr<function, u32>) {
+            (*r).w_sum += w;
+            (*r).M += c;
+            if (rand(seed) < (w / (*r).w_sum)) {
+                (*r).y = y;
+            }
+        }
+
+        fn evalPHat(pos: vec3f, normal: vec3f, color: vec3f, lightPos: vec3f) -> f32 {
+             let toL = lightPos - pos;
+             let d2 = max(0.02, dot(toL, toL)); // Clamp min distance to avoid singularity
+             let dist = sqrt(d2);
+             let L = toL / dist;
+             let ndl = max(0.0, dot(normal, L));
+             let lCos = max(0.0, dot(vec3f(0.0,-1.0,0.0), -L));
+             if (ndl > 0.0 && lCos > 0.0) {
+                 return luminance(color) * 4.7745 * (ndl * lCos / d2);
+             }
+             return 0.0;
+        }
 
         @compute @workgroup_size(16, 16)
         fn main(@builtin(global_invocation_id) id: vec3u) {
@@ -211,9 +248,25 @@
             var throughput = vec3f(1.0); var radiance = vec3f(0.0);
             var specularBounce = true;
 
+            var firstDiffuse = true;
+
+            // ReSTIR State (Initialize outside loop)
+            var R = emptyReservoir();
+            var hasHit = false;
+            var firstHitNorm = vec3f(0.0);
+            var firstHitDepth = 0.0;
+
             for(var b=0; b<6; b++) {
                 let hit = scene(ray);
                 if(!hit.hit) { break; }
+                
+                // Store G-Buffer for first hit (for reprojection)
+                if (b == 0) {
+                    hasHit = true;
+                    firstHitNorm = hit.normal;
+                    firstHitDepth = distance(hit.pos, u.cameraPos.xyz);
+                }
+
                 if(length(hit.emission) > 0.0) { 
                     if(specularBounce){ radiance+=throughput*hit.emission; } 
                     break; 
@@ -246,13 +299,101 @@
                     throughput *= hit.color;
                     specularBounce = true;
                 } else {
-                    // Diffuse NEE
-                    let lx = rand(&seed)*0.5-0.25; let lz = rand(&seed)*0.5-0.25; let lPos = vec3f(lx, 0.998, lz);
-                    let toL = lPos - hit.pos; let d2 = dot(toL,toL); let dist = sqrt(d2); let L = toL/dist;
-                    let ndl = max(0.0, dot(hit.normal, L));
-                    if(ndl > 0.0 && shadow(hit.pos+hit.normal*0.001, lPos)) {
-                        let lCos = max(0.0, dot(vec3f(0.0,-1.0,0.0), -L));
-                        radiance += throughput * hit.color * vec3f(15.0) * (ndl * 0.25 / d2) * lCos * 0.3183;
+                    if (firstDiffuse) {
+                        // ReSTIR (Primary Diffuse Interaction)
+                        
+                        // 1. Initial Candidates
+                        for (var i=0; i<32; i++) {
+                            let lx = rand(&seed)*0.5-0.25; let lz = rand(&seed)*0.5-0.25; let lPos = vec3f(lx, 0.998, lz);
+                            let p_hat = evalPHat(hit.pos, hit.normal, hit.color, lPos);
+                            let w = p_hat * 0.25;
+                            updateReservoir(&R, vec4f(lPos, 1.0), w, 1u, &seed);
+                        }
+
+                        var p_hat_curr = evalPHat(hit.pos, hit.normal, hit.color, R.y.xyz);
+                        R.W = 0.0;
+                        if(p_hat_curr > 0.0) { 
+                            R.W = R.w_sum / max(1e-5, f32(R.M) * p_hat_curr); 
+                        }
+
+                        // 2. Temporal Reuse
+                        if (u.frame > 1.0) {
+                            let idx = id.y * dims.x + id.x;
+                            var prevR = resInput[idx];
+                            let prevND = textureLoad(normDepthInput, id.xy, 0);
+                            
+                            // Use current hit geometry for validation against history
+                            // Note: If firstDiffuse is NOT the first bounce (e.g. seen through glass), 
+                            // reprojection using id.xy is technically incorrect but we stick to it for simplicity.
+                            // Ideally we'd use the stored G-buffer from the previous frame's primary hit.
+                            // But we are using the current hit's normal/depth to validate.
+                            // If we hit glass first, firstHitNorm is glass, but hit.normal is wall.
+                            // We should probably use hit.normal for validation of the LIGHTING context.
+                            // But temporal reprojection relies on SURFACE stability.
+                            
+                            let depth = distance(hit.pos, u.cameraPos.xyz);
+                            if (dot(prevND.xyz, hit.normal) > 0.9 && abs(prevND.w - depth) < 0.1 * depth) {
+                                prevR.M = min(prevR.M, 20u * R.M);
+                                let p_hat_prev = evalPHat(hit.pos, hit.normal, hit.color, prevR.y.xyz);
+                                let w_prev = p_hat_prev * prevR.W * f32(prevR.M);
+                                updateReservoir(&R, prevR.y, w_prev, prevR.M, &seed);
+                            }
+                        }
+
+                        // 3. Spatial Reuse
+                        let currDepth = distance(hit.pos, u.cameraPos.xyz);
+                        for (var k=0; k<3; k++) {
+                             let rad = 30.0;
+                             let angle = rand(&seed) * 6.283;
+                             let r = sqrt(rand(&seed)) * rad;
+                             let offset = vec2f(cos(angle), sin(angle)) * r;
+                             let nPos = vec2i(vec2f(id.xy) + offset);
+                             if (nPos.x >= 0 && nPos.x < i32(dims.x) && nPos.y >= 0 && nPos.y < i32(dims.y)) {
+                                 let nIdx = u32(nPos.y) * dims.x + u32(nPos.x);
+                                 var nR = resInput[nIdx];
+                                 let nND = textureLoad(normDepthInput, nPos, 0);
+                                 
+                                 if (dot(nND.xyz, hit.normal) > 0.9 && abs(nND.w - currDepth) < 0.1 * currDepth) {
+                                     let p_hat_n = evalPHat(hit.pos, hit.normal, hit.color, nR.y.xyz);
+                                     let w_n = p_hat_n * nR.W * f32(nR.M);
+                                     updateReservoir(&R, nR.y, w_n, nR.M, &seed);
+                                 }
+                             }
+                        }
+
+                    let final_p_hat = evalPHat(hit.pos, hit.normal, hit.color, R.y.xyz);
+                    R.W = 0.0;
+                    if (final_p_hat > 0.0) { 
+                        R.W = R.w_sum / max(1e-5, f32(R.M) * final_p_hat); 
+                        R.W = min(R.W, 10.0); // Clamp excessive weights (firefly reduction)
+                    }
+
+                    // Visibility test for the final chosen light
+                    if (shadow(hit.pos+hit.normal*0.001, R.y.xyz)) {
+                        let lPos = R.y.xyz;
+                        let toL = lPos - hit.pos; let d2 = max(0.02, dot(toL,toL));
+                        let ndl = max(0.0, dot(hit.normal, normalize(toL)));
+                        let lCos = max(0.0, dot(vec3f(0.0,-1.0,0.0), -normalize(toL)));
+                        let val = hit.color * 4.7745 * (ndl * lCos / d2);
+                        radiance += throughput * val * R.W;
+                    }
+                    
+                    // For next frame validation, we store the geometry of the surface where we did ReSTIR.
+                        // Note: We'll overwrite the G-Buffer with this surface's info. 
+                        // If we hit glass then wall, we store wall. This makes temporal reuse VALID for the wall.
+                        firstHitNorm = hit.normal;
+                        firstHitDepth = currDepth;
+                        
+                        firstDiffuse = false;
+                    } else {
+                        // Secondary Diffuse Bounce (Simple NEE)
+                        let lx = rand(&seed)*0.5-0.25; let lz = rand(&seed)*0.5-0.25; let lPos = vec3f(lx, 0.998, lz);
+                        let toL = lPos - hit.pos; let d2 = dot(toL,toL); let dist = sqrt(d2); let L = toL/dist;
+                        let ndl = max(0.0, dot(hit.normal, L));
+                        if(ndl > 0.0 && shadow(hit.pos+hit.normal*0.001, lPos)) {
+                            let lCos = max(0.0, dot(vec3f(0.0,-1.0,0.0), -L));
+                            radiance += throughput * hit.color * vec3f(15.0) * (ndl * 0.25 / d2) * lCos * 0.3183;
+                        }
                     }
                     
                     throughput *= hit.color;
@@ -267,6 +408,15 @@
                 }
 
                 if(b>2) { let p = max(throughput.x, max(throughput.y, throughput.z)); if(rand(&seed)>p){break;} throughput/=p; }
+            }
+
+            // Write Reservoir & G-Buffer
+            let outIdx = id.y * dims.x + id.x;
+            resOutput[outIdx] = R;
+            if (hasHit) {
+                textureStore(normDepthOutput, id.xy, vec4f(firstHitNorm, firstHitDepth));
+            } else {
+                textureStore(normDepthOutput, id.xy, vec4f(0.0, 0.0, 0.0, 1e20));
             }
 
             // --- Adaptive Accumulation ---
@@ -415,6 +565,8 @@
         const sampEl = document.getElementById('samples');
 
         let device, context, computePipe, renderPipe, uBuff, texA, texB, bindGroupA, bindGroupB, sampler;
+        let resBufA, resBufB;
+        let texNormDepthA, texNormDepthB;
         // Denoise globals
         let denoisePipe, denoiseBuff, denoiseBindGroups = [], texDenoiseA, texDenoiseB;
         let frame = 0, cam = { pos: [0,0,2.7], pitch:0, yaw:Math.PI }, keys = {};
@@ -465,14 +617,38 @@
             frame = 0; 
             if(texA) texA.destroy(); if(texB) texB.destroy();
             if(texDenoiseA) texDenoiseA.destroy(); if(texDenoiseB) texDenoiseB.destroy();
+            if(resBufA) resBufA.destroy(); if(resBufB) resBufB.destroy();
+            if(texNormDepthA) texNormDepthA.destroy(); if(texNormDepthB) texNormDepthB.destroy();
 
             texA = createTex(rndW, rndH);
             texB = createTex(rndW, rndH);
             texDenoiseA = createTex(rndW, rndH);
             texDenoiseB = createTex(rndW, rndH);
+            texNormDepthA = createTex(rndW, rndH);
+            texNormDepthB = createTex(rndW, rndH);
 
-            bindGroupA = device.createBindGroup({ layout: computePipe.getBindGroupLayout(0), entries: [{binding:0, resource:{buffer:uBuff}}, {binding:1, resource:texA.createView()}, {binding:2, resource:texB.createView()}]});
-            bindGroupB = device.createBindGroup({ layout: computePipe.getBindGroupLayout(0), entries: [{binding:0, resource:{buffer:uBuff}}, {binding:1, resource:texB.createView()}, {binding:2, resource:texA.createView()}]});
+            const resSize = rndW * rndH * 32;
+            resBufA = device.createBuffer({ size: resSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            resBufB = device.createBuffer({ size: resSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+
+            bindGroupA = device.createBindGroup({ layout: computePipe.getBindGroupLayout(0), entries: [
+                {binding:0, resource:{buffer:uBuff}}, 
+                {binding:1, resource:texA.createView()}, 
+                {binding:2, resource:texB.createView()},
+                {binding:3, resource:{buffer:resBufA}},
+                {binding:4, resource:{buffer:resBufB}},
+                {binding:5, resource:texNormDepthA.createView()},
+                {binding:6, resource:texNormDepthB.createView()}
+            ]});
+            bindGroupB = device.createBindGroup({ layout: computePipe.getBindGroupLayout(0), entries: [
+                {binding:0, resource:{buffer:uBuff}}, 
+                {binding:1, resource:texB.createView()}, 
+                {binding:2, resource:texA.createView()},
+                {binding:3, resource:{buffer:resBufB}},
+                {binding:4, resource:{buffer:resBufA}},
+                {binding:5, resource:texNormDepthB.createView()},
+                {binding:6, resource:texNormDepthA.createView()}
+            ]});
         
             // Denoise bind groups (ping-ponging for 5 levels)
             // We need pairs for each pass: (Input, Output)
