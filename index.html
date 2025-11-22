@@ -349,10 +349,6 @@
             
             var seed = (id.y * dims.x + id.x) * 719393u + u32(u.frame) * 56029u + 12345u;
             
-            // Re-trace primary ray to get hit point (redundant but clean)
-            // Optimization: Could store hit point in G-buffer but we only have Norm/Depth.
-            // Retracing is cheap for 1 bounce.
-            
             let jitter = vec2f(rand(&seed), rand(&seed)) - 0.5;
             let uv = (vec2f(id.xy) + jitter) / u.resolution * 2.0 - 1.0;
             let aspect = u.resolution.x / u.resolution.y;
@@ -388,9 +384,10 @@
                     hit = scene(ray);
                     specularBounce = true;
                 } else {
-                    // Diffuse Hit found
-                    let idx = id.y * dims.x + id.x;
-                    var R = resInter[idx];
+                    if (firstDiffuse) {
+                        // Diffuse Hit found
+                        let idx = id.y * dims.x + id.x;
+                        var R = resInter[idx];
                     
                     // 3. Spatial Reuse
                     let currDepth = distance(hit.pos, u.cameraPos.xyz);
@@ -453,13 +450,32 @@
                         radiance += throughput * val * R.W;
                     }
                     
-                    // Secondary Bounce NEE (Fallback)
-                    // ... (omitted for brevity, using single bounce for now)
-                    
+                    // Mark processed
                     firstDiffuse = false;
-                    break;
+                } else {
+                    // Secondary Bounce NEE (Standard)
+                    let lx = rand(&seed)*0.5-0.25; let lz = rand(&seed)*0.5-0.25; let lPos = vec3f(lx, 0.998, lz);
+                    let toL = lPos - hit.pos; let d2 = dot(toL,toL); let dist = sqrt(d2); let L = toL/dist;
+                    let ndl = max(0.0, dot(hit.normal, L));
+                    if(ndl > 0.0 && shadow(hit.pos+hit.normal*0.001, lPos)) {
+                        let lCos = max(0.0, dot(vec3f(0.0,-1.0,0.0), -L));
+                        radiance += throughput * hit.color * vec3f(15.0) * (ndl * 0.25 / d2) * lCos * 0.3183;
+                    }
                 }
+                
+                // Continue Path Tracing (Indirect Bounce)
+                throughput *= hit.color;
+                let r1=rand(&seed); let r2=rand(&seed); let phi=6.283*r1; let sq=sqrt(r2);
+                let loc = vec3f(cos(phi)*sq, sin(phi)*sq, sqrt(1.0-r2));
+                let n = hit.normal;
+                let a = select(vec3f(1.0,0.0,0.0), vec3f(0.0,1.0,0.0), abs(n.x)>0.9);
+                let t = normalize(cross(n,a)); let bt = cross(n,t);
+                ray.direction = t*loc.x + bt*loc.y + n*loc.z;
+                ray.origin = hit.pos + n*0.001;
+                specularBounce = false;
+                hit = scene(ray);
             }
+        }
             
             var finalColor = vec4f(radiance, 1.0);
             if (u.frame > 1.0) {
@@ -658,40 +674,32 @@
             resBufInter = device.createBuffer({ size: resSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
 
             // Temporal Pass A: Read Prev(A), Write Inter, Write G-Buff(A)
+            // Bindings 1 (History) and 4 (ResOutput) are unused in Temporal Pass
             bindGroupATem = device.createBindGroup({ layout: computePipeTemporal.getBindGroupLayout(0), entries: [
                 {binding:0, resource:{buffer:uBuff}}, 
-                {binding:1, resource:texA.createView()}, // History (for mix weight? No, used in Spatial) - Wait, Temporal pass doesn't use historyTex except for reprojection? No, reprojection uses normDepthInput.
-                {binding:2, resource:texB.createView()}, // OutputTex (Unused in Temporal)
+                {binding:2, resource:texB.createView()}, // OutputTex (Used for dims)
                 {binding:3, resource:{buffer:resBufA}}, // Input Reservoir (Prev)
-                {binding:4, resource:{buffer:resBufA}}, // Output Reservoir (Unused - we write to Inter)
                 {binding:5, resource:texNormDepthA.createView()}, // NormDepthInput (Prev)
                 {binding:6, resource:texNormDepthB.createView()}, // NormDepthOutput (Current)
                 {binding:7, resource:{buffer:resBufInter}} // Inter
             ]});
 
-            // Spatial Pass A: Read Inter, Write Next(B), Read G-Buff(A - as texture? No, we need current frame normal)
-            // Current frame normal was written to texNormDepthB in Temporal Pass A.
-            // We need to read texNormDepthB in Spatial Pass A.
-            // Binding 5 is normDepthInput.
-            
+            // Spatial Pass A: Read Inter, Write Next(B), Read G-Buff(A)
+            // Bindings 3 (ResInput) and 6 (NormDepthOutput) are unused in Spatial Pass
             bindGroupASpa = device.createBindGroup({ layout: computePipeSpatial.getBindGroupLayout(0), entries: [
                 {binding:0, resource:{buffer:uBuff}}, 
                 {binding:1, resource:texA.createView()}, // History (Read)
                 {binding:2, resource:texB.createView()}, // Output (Write)
-                {binding:3, resource:{buffer:resBufA}}, // ResInput (Unused)
                 {binding:4, resource:{buffer:resBufB}}, // ResOutput (Write)
                 {binding:5, resource:texNormDepthB.createView()}, // NormDepthInput (Current - Read)
-                {binding:6, resource:texNormDepthB.createView()}, // NormDepthOutput (Unused)
                 {binding:7, resource:{buffer:resBufInter}} // Inter (Read)
             ]});
 
             // Temporal Pass B: Read Prev(B), Write Inter, Write G-Buff(B)
             bindGroupBTem = device.createBindGroup({ layout: computePipeTemporal.getBindGroupLayout(0), entries: [
                 {binding:0, resource:{buffer:uBuff}}, 
-                {binding:1, resource:texB.createView()}, 
                 {binding:2, resource:texA.createView()},
                 {binding:3, resource:{buffer:resBufB}}, // Read Prev
-                {binding:4, resource:{buffer:resBufB}}, 
                 {binding:5, resource:texNormDepthB.createView()}, // Read Prev
                 {binding:6, resource:texNormDepthA.createView()}, // Write Current
                 {binding:7, resource:{buffer:resBufInter}}
@@ -702,10 +710,8 @@
                 {binding:0, resource:{buffer:uBuff}}, 
                 {binding:1, resource:texB.createView()}, 
                 {binding:2, resource:texA.createView()}, 
-                {binding:3, resource:{buffer:resBufB}},
                 {binding:4, resource:{buffer:resBufA}}, // Write Next
                 {binding:5, resource:texNormDepthA.createView()}, // Read Current
-                {binding:6, resource:texNormDepthA.createView()}, 
                 {binding:7, resource:{buffer:resBufInter}}
             ]});
         
