@@ -94,7 +94,7 @@
             }
         };
 
-        const MAX_BOUNCES = 6;
+        const MAX_BOUNCES = 2;
         const computeShader = `
         struct Uniforms {
             cameraPos: vec4f,
@@ -198,7 +198,7 @@
                         best.emission = vec3f(15.0); best.mat = 0u; tMax = tLight;
                     }
                 }
-            hitSphere(r, vec3f(0.0, -0.7, 0.15), 0.09, 3.3333, vec3f(0.98), 1u, &tMax, &best);
+            // hitSphere(r, vec3f(0.0, -0.7, 0.15), 0.09, 3.3333, vec3f(0.98), 1u, &tMax, &best);
             hitBox(r, vec3f(-0.27,-0.4,0.3), vec3f(0.28,0.6,0.28), -0.3, white, &tMax, &best);
             hitBox(r, vec3f(0.27,-0.7,-0.2), vec3f(0.28,0.3,0.28), 0.3, white, &tMax, &best);
             return best;
@@ -505,7 +505,7 @@
         struct Uniforms {
             resolution: vec2f,
             stepWidth: f32,
-            padding: f32,
+            denoiseStrength: f32,
         };
         @group(0) @binding(2) var<uniform> u: Uniforms;
 
@@ -537,9 +537,8 @@
                     
                     let diff = length(c.rgb - center.rgb);
                     
-                    // Very strict edge stopping
-                    // Reduced from 256.0 to 64.0 because we are doing fewer passes, so we need slightly more blend power.
-                    let w_color = exp(-diff * diff * 64.0); 
+                    // Edge stopping function - strength controlled by uniform
+                    let w_color = exp(-diff * diff * u.denoiseStrength); 
                     
                     // Simple box weight
                     let w = w_color;
@@ -622,6 +621,7 @@
         let denoisingEnabled = false;
         let minSamplesMode = false;
         let renderScale = 1.0;
+        let denoiseStrength = 200.0; // Higher = weaker denoising (stricter edge-stopping), Lower = stronger denoising (more aggressive smoothing)
         
         let viewProj = Mat4.create();
         let prevViewProj = Mat4.create();
@@ -846,14 +846,14 @@
                 const denoiseIdx = (finalTex === texB) ? 0 : 1;
 
                 dPass.setBindGroup(0, denoiseBindGroups[denoiseIdx]); 
-                device.queue.writeBuffer(denoiseBuff, 0, new Float32Array([texA.width, texA.height, step, 0]));
+                device.queue.writeBuffer(denoiseBuff, 0, new Float32Array([texA.width, texA.height, step, denoiseStrength]));
                 dPass.dispatchWorkgroups(Math.ceil(texA.width/16), Math.ceil(texA.height/16));
                 
                 for(let i=0; i<2; i++) {
                     step *= 2;
                     let idx = 2 + (i%2); 
                     dPass.setBindGroup(0, denoiseBindGroups[idx]);
-                    device.queue.writeBuffer(denoiseBuff, 0, new Float32Array([texA.width, texA.height, step, 0]));
+                    device.queue.writeBuffer(denoiseBuff, 0, new Float32Array([texA.width, texA.height, step, denoiseStrength]));
                     dPass.dispatchWorkgroups(Math.ceil(texA.width/16), Math.ceil(texA.height/16));
                 }
                 dPass.end();
