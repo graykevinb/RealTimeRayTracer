@@ -287,7 +287,8 @@
                 } else {
                     if (firstDiffuse) {
                         // 1. Initial Candidates
-                        for (var i=0; i<32; i++) {
+                        // OPTIMIZATION: Reduced from 32 to 8 for speed
+                        for (var i=0; i<15; i++) {
                             let lx = rand(&seed)*0.5-0.25; let lz = rand(&seed)*0.5-0.25; let lPos = vec3f(lx, 0.998, lz);
                             let p_hat = evalPHat(hit.pos, hit.normal, hit.color, lPos);
                             let w = p_hat * 0.25;
@@ -396,7 +397,7 @@
                     // We can use it to validate spatial neighbors from THIS frame
                     
                     for (var k=0; k<3; k++) {
-                         let rad = 30.0;
+                         let rad = 15.0; // OPTIMIZATION: Smaller radius
                          let angle = rand(&seed) * 6.283;
                          let r = sqrt(rand(&seed)) * rad;
                          let offset = vec2f(cos(angle), sin(angle)) * r;
@@ -466,6 +467,14 @@
                 
                 // Continue Path Tracing (Indirect Bounce)
                 throughput *= hit.color;
+
+                // OPTIMIZATION: Russian Roulette
+                if (b >= 2) {
+                    let p = max(throughput.x, max(throughput.y, throughput.z));
+                    if (rand(&seed) > p) { break; }
+                    throughput /= p;
+                }
+
                 let r1=rand(&seed); let r2=rand(&seed); let phi=6.283*r1; let sq=sqrt(r2);
                 let loc = vec3f(cos(phi)*sq, sin(phi)*sq, sqrt(1.0-r2));
                 let n = hit.normal;
