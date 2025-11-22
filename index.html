@@ -36,6 +36,7 @@
         <div class="btn" data-key="q">▼</div>
         <div class="btn" id="upscale-btn" style="font-size: 10px;">Upscaling</div>
         <div class="btn" id="denoise-btn" style="font-size: 10px;">Denoise</div>
+        <div class="btn" id="min-samples-btn" style="font-size: 10px;">Min Samples</div>
     </div>
     <canvas id="canvas"></canvas>
     <script type="module">
@@ -422,6 +423,7 @@
         let pingPong = 0;
         let upscalingEnabled = false;
         let denoisingEnabled = false;
+        let minSamplesMode = false;
         let renderScale = 1.0;
 
         async function init() {
@@ -507,67 +509,81 @@
 
         function loop(now) {
             const dt = now - lastTime; lastTime = now; fpsEl.innerText = Math.round(1000/dt);
+            
             const vecs = updateCam();
-            frame++;
+            // If minSamplesMode is ON and we just reset (frame=0), we force 2 passes to get instant 2 samples.
+            let passes = 1;
+            if (minSamplesMode && frame === 0) {
+                passes = 2;
+            }
+
+            let finalTex = null;
+
+            for (let i = 0; i < passes; i++) {
+                frame++;
+                device.queue.writeBuffer(uBuff, 0, new Float32Array([...cam.pos, 0, ...vecs.fwd, 0, ...vecs.r, 0, ...vecs.u, 0, texA.width, texA.height, frame, upscalingEnabled ? 1 : 0]));
+
+                const enc = device.createCommandEncoder();
+                const cBind = pingPong === 0 ? bindGroupA : bindGroupB;
+                // The texture we are writing to is the output of this pass
+                finalTex = pingPong === 0 ? texB : texA;
+                
+                const cPass = enc.beginComputePass();
+                cPass.setPipeline(computePipe);
+                cPass.setBindGroup(0, cBind);
+                cPass.dispatchWorkgroups(Math.ceil(texA.width/16), Math.ceil(texA.height/16));
+                cPass.end();
+                
+                device.queue.submit([enc.finish()]);
+                
+                // Toggle for next pass
+                pingPong = 1 - pingPong;
+            }
+            
             sampEl.innerText = frame;
 
-            device.queue.writeBuffer(uBuff, 0, new Float32Array([...cam.pos, 0, ...vecs.fwd, 0, ...vecs.r, 0, ...vecs.u, 0, texA.width, texA.height, frame, upscalingEnabled ? 1 : 0]));
-
+            // Denoise & Render using finalTex (output of last pass)
             const enc = device.createCommandEncoder();
-            const cBind = pingPong === 0 ? bindGroupA : bindGroupB;
-            const dTex = pingPong === 0 ? texB : texA;
-            
-            const cPass = enc.beginComputePass();
-            cPass.setPipeline(computePipe);
-            cPass.setBindGroup(0, cBind);
-            cPass.dispatchWorkgroups(Math.ceil(texA.width/16), Math.ceil(texA.height/16));
-            cPass.end();
 
             if(denoisingEnabled) {
                 const dPass = enc.beginComputePass();
                 dPass.setPipeline(denoisePipe);
                 
                 let step = 1;
-                // Initial Pass: Render Target -> Denoise A
-                // Depending on pingPong, render target is in texB (pingPong=0) or texA (pingPong=1)
-                // denoiseBindGroups[0] reads from texB, [1] reads from texA
-                dPass.setBindGroup(0, denoiseBindGroups[pingPong]); 
+                
+                // Denoise Input Bind Group:
+                // We need to read 'finalTex'.
+                // The bind groups are:
+                // 0: Read B (write DenoiseA)
+                // 1: Read A (write DenoiseA)
+                const denoiseIdx = (finalTex === texB) ? 0 : 1;
+
+                dPass.setBindGroup(0, denoiseBindGroups[denoiseIdx]); 
                 device.queue.writeBuffer(denoiseBuff, 0, new Float32Array([texA.width, texA.height, step, 0]));
                 dPass.dispatchWorkgroups(Math.ceil(texA.width/16), Math.ceil(texA.height/16));
                 
-                // Subsequent passes ping-pong between DenoiseA and DenoiseB
-                // Reduced passes from 4 to 2 (Total 3 passes: 1, 2, 4) to prevent long-distance ghosting.
-                // Without G-Buffers (Normals/Depth), large strides (8, 16) are unsafe.
                 for(let i=0; i<2; i++) {
                     step *= 2;
-                    let idx = 2 + (i%2); // BindGroup 2 or 3
+                    let idx = 2 + (i%2); 
                     dPass.setBindGroup(0, denoiseBindGroups[idx]);
                     device.queue.writeBuffer(denoiseBuff, 0, new Float32Array([texA.width, texA.height, step, 0]));
                     dPass.dispatchWorkgroups(Math.ceil(texA.width/16), Math.ceil(texA.height/16));
                 }
                 dPass.end();
+                
+                finalTex = texDenoiseA; 
             }
 
             const rPass = enc.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store' }] });
             rPass.setPipeline(renderPipe);
             
-            // Final result depends on ping-pong count.
-            // Pass 1: Render->A.
-            // Loop 0: A->B.
-            // Loop 1: B->A.
-            // Result ends in A.
-            let finalTex = dTex;
-            if(denoisingEnabled) {
-                 finalTex = texDenoiseA;
-            }
-
             const dispBind = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [{binding:0, resource:finalTex.createView()}, {binding:1, resource:sampler}, {binding:2, resource:{buffer:uBuff}}] });
             rPass.setBindGroup(0, dispBind);
             rPass.draw(6);
             rPass.end();
 
             device.queue.submit([enc.finish()]);
-            pingPong = 1 - pingPong;
+            
             requestAnimationFrame(loop);
         }
 
@@ -597,6 +613,17 @@
             };
             denoiseBtn.addEventListener('pointerdown', toggleDenoise);
 
+            // Min Samples Toggle
+            const minSamplesBtn = document.getElementById('min-samples-btn');
+            const toggleMinSamples = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                minSamplesMode = !minSamplesMode;
+                minSamplesBtn.style.background = minSamplesMode ? 'rgba(100, 255, 100, 0.5)' : '';
+                frame = 0; // Reset frame counter when toggling
+            };
+            minSamplesBtn.addEventListener('pointerdown', toggleMinSamples);
+
             // Mouse
             canvas.addEventListener('click', () => canvas.requestPointerLock());
             window.addEventListener('mousemove', e => {
@@ -606,7 +633,7 @@
             });
 
             // Touch
-            document.querySelectorAll('.btn:not(#upscale-btn):not(#denoise-btn)').forEach(b => {
+            document.querySelectorAll('.btn:not(#upscale-btn):not(#denoise-btn):not(#min-samples-btn)').forEach(b => {
                 b.addEventListener('touchstart', (e) => { e.preventDefault(); keys[b.dataset.key] = true; });
                 b.addEventListener('touchend', (e) => { e.preventDefault(); keys[b.dataset.key] = false; });
             });
